@@ -33,9 +33,13 @@ func ChatCompletions(c *gin.Context) {
 	}
 
 	// 提取用户消息 (Extract user message)
+	var firstUserMessage string
 	var userMessage string
 	for _, msg := range req.Messages {
 		if msg.Role == "user" {
+			if firstUserMessage == "" {
+				firstUserMessage = msg.Content
+			}
 			userMessage = msg.Content
 		}
 	}
@@ -44,6 +48,8 @@ func ChatCompletions(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "No user message found"})
 		return
 	}
+
+	convKey := uuid.NewSHA1(uuid.NameSpaceOID, []byte(firstUserMessage)).String()
 
 	logger.Info("收到聊天请求",
 		zap.String("model", req.Model),
@@ -61,11 +67,13 @@ func ChatCompletions(c *gin.Context) {
 	}
 	defer mgr.Release(client)
 
+	sess := mgr.GetOrCreateSession(authHeader, convKey)
+
 	// 流式 vs 非流式 (Streaming vs Non-Streaming)
 	if req.Stream {
-		handleStream(c, client, req.Model, userMessage)
+		handleStream(c, mgr, authHeader, convKey, sess, client, req.Model, userMessage)
 	} else {
-		handleNormal(c, client, req.Model, userMessage)
+		handleNormal(c, mgr, authHeader, convKey, sess, client, req.Model, userMessage)
 	}
 }
 
@@ -78,10 +86,10 @@ func truncate(s string, max int) string {
 }
 
 // handleNormal 处理非流式响应
-func handleNormal(c *gin.Context, client *upstream.Client, model, userMessage string) {
+func handleNormal(c *gin.Context, mgr *upstream.Manager, token, convKey string, sess upstream.Session, client *upstream.Client, model, userMessage string) {
 	var fullContent strings.Builder
 
-	err := client.ProcessChat(userMessage, func(chunk string) {
+	dialogID, err := client.ProcessChatWithSession(sess.DialogID, sess.UserID, userMessage, func(chunk string) {
 		fullContent.WriteString(chunk)
 	}, nil)
 
@@ -90,6 +98,8 @@ func handleNormal(c *gin.Context, client *upstream.Client, model, userMessage st
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Upstream error: " + err.Error()})
 		return
 	}
+
+	mgr.UpdateSession(token, convKey, dialogID, sess.UserID)
 
 	content := fullContent.String()
 	resp := types.ChatCompletionResponse{
@@ -117,7 +127,7 @@ func handleNormal(c *gin.Context, client *upstream.Client, model, userMessage st
 }
 
 // handleStream 处理流式响应 (SSE)
-func handleStream(c *gin.Context, client *upstream.Client, model, userMessage string) {
+func handleStream(c *gin.Context, mgr *upstream.Manager, token, convKey string, sess upstream.Session, client *upstream.Client, model, userMessage string) {
 	c.Header("Content-Type", "text/event-stream")
 	c.Header("Cache-Control", "no-cache")
 	c.Header("Connection", "keep-alive")
@@ -154,7 +164,7 @@ func handleStream(c *gin.Context, client *upstream.Client, model, userMessage st
 		}
 
 		// 2. Process chunks
-		err := client.ProcessChat(userMessage, func(chunk string) {
+		dialogID, err := client.ProcessChatWithSession(sess.DialogID, sess.UserID, userMessage, func(chunk string) {
 			resp := types.ChatCompletionStreamResponse{
 				ID:      id,
 				Object:  "chat.completion.chunk",
@@ -200,6 +210,7 @@ func handleStream(c *gin.Context, client *upstream.Client, model, userMessage st
 			logger.Error("上游处理中断 (流式)", zap.Error(err))
 			return false
 		}
+		mgr.UpdateSession(token, convKey, dialogID, sess.UserID)
 		logger.Info("流式请求处理完成")
 		return false
 	})

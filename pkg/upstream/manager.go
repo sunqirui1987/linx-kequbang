@@ -2,16 +2,19 @@ package upstream
 
 import (
 	"sync"
+	"time"
 
 	"linx-kequbang/pkg/logger"
 
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 )
 
 // Manager 管理基于 API Token 的连接池
 // Manager handles a pool of connections keyed by API token.
 type Manager struct {
-	pools sync.Map // map[string]*TokenPool
+	pools    sync.Map // map[string]*TokenPool
+	sessions sync.Map // map[string]*Session
 }
 
 // TokenPool 针对单个 Token 的连接池
@@ -21,6 +24,13 @@ type TokenPool struct {
 	mu       sync.Mutex
 	maxSize  int
 	currSize int
+}
+
+type Session struct {
+	DialogID  string
+	UserID    string
+	UpdatedAt time.Time
+	CreatedAt time.Time
 }
 
 var globalManager *Manager
@@ -33,6 +43,44 @@ func GetManager() *Manager {
 		globalManager = &Manager{}
 	})
 	return globalManager
+}
+
+func (m *Manager) sessionKey(token, convKey string) string {
+	return token + "|" + convKey
+}
+
+func (m *Manager) GetOrCreateSession(token, convKey string) Session {
+	key := m.sessionKey(token, convKey)
+	if v, ok := m.sessions.Load(key); ok {
+		return v.(Session)
+	}
+
+	now := time.Now()
+	sess := Session{
+		DialogID:  uuid.NewSHA1(uuid.NameSpaceOID, []byte("dialog|"+token+"|"+convKey)).String(),
+		UserID:    "user_" + uuid.NewSHA1(uuid.NameSpaceOID, []byte("user|"+token)).String()[:8],
+		UpdatedAt: now,
+		CreatedAt: now,
+	}
+	m.sessions.Store(key, sess)
+	return sess
+}
+
+func (m *Manager) UpdateSession(token, convKey, dialogID, userID string) {
+	key := m.sessionKey(token, convKey)
+	now := time.Now()
+
+	sess := Session{
+		DialogID:  dialogID,
+		UserID:    userID,
+		UpdatedAt: now,
+		CreatedAt: now,
+	}
+	if v, ok := m.sessions.Load(key); ok {
+		old := v.(Session)
+		sess.CreatedAt = old.CreatedAt
+	}
+	m.sessions.Store(key, sess)
 }
 
 // Acquire 获取一个可用连接
@@ -49,7 +97,7 @@ func (m *Manager) Acquire(token string) (*Client, error) {
 	select {
 	case client := <-pool.clients:
 		if client.IsAlive() {
-			logger.Debug("重用现有连接", zap.String("token_prefix", token[:10]+"..."))
+			logger.Debug("重用现有连接", zap.String("token_prefix", tokenPreview(token)))
 			return client, nil
 		}
 		// 如果连接已死，创建新连接
@@ -58,7 +106,7 @@ func (m *Manager) Acquire(token string) (*Client, error) {
 		// 无空闲连接，创建新连接
 	}
 
-	logger.Info("创建新连接", zap.String("token_prefix", token[:10]+"..."))
+	logger.Info("创建新连接", zap.String("token_prefix", tokenPreview(token)))
 	return NewClient(token)
 }
 
@@ -84,7 +132,7 @@ func (m *Manager) Release(client *Client) {
 		logger.Debug("连接已归还到池中")
 	default:
 		// 池已满，关闭连接
-		logger.Warn("连接池已满，关闭多余连接", zap.String("token_prefix", client.token[:10]+"..."))
+		logger.Warn("连接池已满，关闭多余连接", zap.String("token_prefix", tokenPreview(client.token)))
 		client.Close()
 	}
 }
